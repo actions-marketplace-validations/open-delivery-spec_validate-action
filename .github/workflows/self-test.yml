@@ -6,10 +6,26 @@ on:
   workflow_dispatch:
 
 jobs:
-  ods-pipeline:
+  test-report-generator:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install test dependencies
+        run: pip install pytest
+      - name: Run generate-report.py unit tests
+        run: python -m pytest tests/ -v
+
+  ods-pipeline:
+    runs-on: ubuntu-latest
+    # The action installs the CLI via `go install ...@main`. Resolve the main
+    # tip directly from the source forge instead of the module proxy, whose
+    # branch→version cache lags fresh merges — otherwise a self-test exercising
+    # a just-merged CLI change installs the stale pre-change binary.
+    env:
+      GOPROXY: direct
+      GOSUMDB: "off"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -66,6 +82,80 @@ jobs:
           echo "AI detected: ${{ steps.with-pr-body.outputs.ai-detected }}"
           test "${{ steps.with-pr-body.outputs.ai-detected }}" = "true"
 
+      - name: Pipeline with external SARIF (Semgrep findings)
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          sarif: test-fixtures/sample-semgrep.sarif
+          # This step asserts the finding is *merged*, not that it blocks —
+          # enforcement has its own step below. Without an explicit permissive
+          # policy the default gate blocks whenever the PR diff happens to
+          # contain code files: the fixture's high finding explodes the
+          # per-KLOC defect density on small diffs, so the step would fail
+          # based on what files a PR touches.
+          policy: test-fixtures/policy-allow-all.rego
+          artifact-name: ods-report-sarif
+          comment: "false"
+
+      - name: Verify external SARIF findings were merged
+        run: |
+          grep -q "dangerous-exec-command" ods-report/analyze.json
+          echo "External SARIF finding merged into analysis ✓"
+
+      - name: Pipeline enforces SARIF findings (policy blocks)
+        id: enforce
+        continue-on-error: true
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          sarif: test-fixtures/sample-semgrep.sarif
+          policy: test-fixtures/policy-block-high.rego
+          artifact-name: ods-report-enforce
+          comment: "false"
+
+      - name: Verify SARIF finding blocked the run
+        run: |
+          test "${{ steps.enforce.outputs.result }}" = "block"
+          grep -q '"allowed": false' ods-report/check.json
+          echo "SARIF high finding enforced by policy gate ✓"
+
+      - name: "Pipeline with built-in Semgrep (semgrep: true)"
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          semgrep: "true"
+          semgrep-config: test-fixtures/semgrep-rules.yml
+          # Same as the SARIF step above: this asserts merging, not blocking.
+          policy: test-fixtures/policy-allow-all.rego
+          artifact-name: ods-report-semgrep
+          comment: "false"
+
+      - name: Verify auto-Semgrep findings were merged
+        run: |
+          grep -q "ods-test-eval-call" ods-report/analyze.json
+          echo "Auto-Semgrep finding merged into analysis ✓"
+
+      - name: Pipeline with AI attribution report
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          report: "true"
+          report-since: "365 days ago"
+          # Exercises the pinned default CLI, which now ships --html (v0.7.2+).
+          artifact-name: ods-report-attribution
+          comment: "false"
+
+      - name: Verify attribution digest and dashboard rendered
+        run: |
+          test -f ods-report/attribution.json
+          test -f ods-report/ods-attribution.md
+          grep -q "AI Attribution" ods-report/ods-attribution.md
+          # Shareable HTML dashboard produced and pointed to from the digest.
+          test -f ods-report/ai-attribution.html
+          grep -q "<svg" ods-report/ai-attribution.html
+          grep -q "ai-attribution.html" ods-report/ods-attribution.md
+          echo "AI attribution digest + dashboard rendered ✓"
+
       - name: Pipeline without PR comment or artifact
         uses: ./
         with:
@@ -82,3 +172,78 @@ jobs:
           artifact-name: ods-report-policy
           comment: "false"
         continue-on-error: true
+
+      - name: "Pipeline with review routing (tier: elevated)"
+        id: routing
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          policy: test-fixtures/policy-route-elevated.rego
+          review-routing: "true"
+          artifact-name: ods-report-routing
+          comment: "false"
+
+      - name: Verify review tier routed and exposed
+        run: |
+          test "${{ steps.routing.outputs.review-tier }}" = "elevated"
+          grep -q '"review_tier": "elevated"' ods-report/check.json
+          echo "Review tier routed and exposed ✓"
+
+      - name: Pipeline with AI review verdict (routes elevated, never blocks)
+        id: aireview
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          # Exercises the pinned default CLI — bump breakages surface here.
+          ai-review: test-fixtures/ai-review-request-changes.json
+          artifact-name: ods-report-aireview
+          comment: "false"
+
+      - name: Verify AI review verdict routed but did not block
+        run: |
+          test "${{ steps.aireview.outputs.review-tier }}" = "elevated"
+          test "${{ steps.aireview.outputs.result }}" != "block"
+          grep -q '"ai_reviews"' ods-report/ods-report.json
+          grep -q "AI Review" ods-report/ods-summary.md
+          echo "AI review verdict routed to elevated without blocking ✓"
+
+      - name: Pipeline with AI review on a CLI that predates the flag
+        id: aireview-oldcli
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          # v0.6.0 predates --ai-review: the input must be skipped with a
+          # warning, never break the gate.
+          cli-ref: v0.6.0
+          ai-review: test-fixtures/ai-review-request-changes.json
+          artifact-name: ods-report-aireview-oldcli
+          comment: "false"
+
+      - name: Verify old CLI degraded gracefully
+        run: |
+          test "${{ steps.aireview-oldcli.outputs.result }}" != "block"
+          # The verdict never entered this run, so its report must not show
+          # one — including leftovers from the previous invocation above.
+          ! grep -q "AI Review" ods-report/ods-summary.md
+          echo "ai-review input skipped safely on a pre---ai-review CLI ✓"
+
+      - name: Pipeline with flag-like tokens in PR body (argument injection)
+        id: flagbody
+        uses: ./
+        with:
+          diff-base: HEAD~1
+          pr-body: |
+            ## Notes
+            Repair with `git push -f origin v1` or --force if needed.
+            -f --json --policy /dev/null
+            ## AI Disclosure
+            - [x] This PR contains AI-generated code
+            - AI Tool: Claude
+          artifact-name: ods-report-flagbody
+          comment: "false"
+
+      - name: Verify flag-like PR body did not break detection
+        run: |
+          grep -vq "_ods_detect_error" ods-report/detect.json
+          test "${{ steps.flagbody.outputs.ai-detected }}" = "true"
+          echo "PR body with flag-like tokens handled safely ✓"

@@ -1,5 +1,5 @@
 name: Open Delivery Spec
-description: AI code quality gate — detect AI code, analyze quality, score tech debt, enforce policy
+description: Governance and visibility for AI-assisted code — attribute, analyze, score, and enforce policy on every PR
 author: Open Delivery Spec Contributors
 branding:
   icon: check-circle
@@ -33,6 +33,74 @@ inputs:
     required: false
     default: '.ods/policy.rego'
 
+  sarif:
+    description: >-
+      Path to a SARIF v2.1.0 file from an external analyzer (Semgrep, CodeQL,
+      golangci-lint, ESLint, ...) to merge into the analysis, score, and policy
+      gate. These findings are authoritative and multi-language; ODS built-in
+      heuristics are only hints.
+    required: false
+    default: ''
+
+  semgrep:
+    description: >-
+      Run Semgrep automatically and merge its findings (zero-setup multi-language
+      analysis). Ignored when `sarif` is set — bring-your-own SARIF wins.
+    required: false
+    default: 'false'
+
+  semgrep-config:
+    description: >-
+      Semgrep ruleset used when `semgrep: true`. Defaults to the curated `auto`
+      registry config; can be a registry ID (e.g. p/ci) or a local rules file.
+    required: false
+    default: 'auto'
+
+  ai-review:
+    description: >-
+      Newline- or comma-separated paths to AI reviewer verdict files
+      (review-verdict/v1 JSON) to feed into the policy gate as
+      input.ai_reviews. Advisory by default: a request_changes verdict routes
+      extra human review, it never denies unless your policy opts in.
+      Requires a CLI with `ods check --ai-review` (v0.7.1+; the pinned
+      default satisfies this); older CLIs skip the input with a warning.
+    required: false
+    default: ''
+
+  mutation-report:
+    description: >-
+      Path to a mutation-testing report (gremlins JSON) produced earlier in the
+      job. Its diff-scoped mutation score is fed to the policy gate as
+      input.mutation_score. Advisory by default: a weak score routes extra
+      review for AI-authored changes, it never denies unless your policy opts
+      in. Requires a CLI with `ods check --mutation`; older CLIs skip the input
+      with a warning.
+    required: false
+    default: ''
+
+  failure-mode:
+    description: >-
+      What to do when a pipeline stage (detect / analyze / score / check) fails
+      to produce a usable result. `warn` (default): mark the run inconclusive
+      and set the result to at least WARN, so a broken stage is never reported
+      as a clean PASS. `block`: fail the run (exit 1) on any inconclusive stage
+      — fail-closed for high-compliance teams.
+    required: false
+    default: 'warn'
+
+  report:
+    description: >-
+      Append an AI attribution digest (AI vs human commit/line share over a
+      window) to the job summary, PR comment, and artifact. Needs full git
+      history (checkout with fetch-depth: 0).
+    required: false
+    default: 'false'
+
+  report-since:
+    description: 'History window for the attribution digest (any git --since expression).'
+    required: false
+    default: '90 days ago'
+
   summary:
     description: 'Append Markdown report to the GitHub Actions job summary'
     required: false
@@ -42,6 +110,23 @@ inputs:
     description: 'Create or update an ODS report comment on pull requests'
     required: false
     default: 'true'
+
+  review-routing:
+    description: >-
+      Act on the policy's review_tier verdict: label the PR
+      (ods:review/auto|standard|elevated) and, for elevated, request the
+      reviewers listed in elevated-reviewers. Requires a policy that defines
+      review_tier and a CLI version that reports it. Routing is advisory and
+      never fails the run.
+    required: false
+    default: 'false'
+
+  elevated-reviewers:
+    description: >-
+      Comma-separated GitHub usernames to request as reviewers when the
+      review tier is "elevated" (used only with review-routing: true).
+    required: false
+    default: ''
 
   artifact:
     description: 'Upload the generated ODS report directory as a workflow artifact'
@@ -69,9 +154,11 @@ inputs:
     default: ${{ github.token }}
 
   cli-ref:
-    description: 'ODS CLI version, tag, or commit to install'
+    description: >-
+      ODS CLI version, tag, or commit to install. Defaults to a pinned stable
+      release for reproducible runs; set to `main` to track the latest.
     required: false
-    default: 'main'
+    default: 'v0.7.6'
 
 outputs:
   result:
@@ -89,12 +176,18 @@ outputs:
   policy-allowed:
     description: 'Whether the OPA policy allowed the change'
     value: ${{ steps.ods.outputs.policy_allowed }}
+  review-tier:
+    description: 'Policy review-routing verdict: auto | standard | elevated'
+    value: ${{ steps.ods.outputs.review_tier }}
+  pipeline-integrity:
+    description: 'ok | inconclusive — whether every pipeline stage completed'
+    value: ${{ steps.ods.outputs.pipeline_integrity }}
 
 runs:
   using: composite
   steps:
     - name: Setup Go
-      uses: actions/setup-go@v6
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version: '1.25'
         cache: false
@@ -105,16 +198,70 @@ runs:
         CLI_REF: ${{ inputs.cli-ref }}
       run: go install "github.com/open-delivery-spec/cli/cmd/ods@${CLI_REF}"
 
+    - name: Run Semgrep (optional)
+      id: semgrep
+      if: inputs.semgrep == 'true'
+      shell: bash
+      env:
+        SEMGREP_CONFIG: ${{ inputs.semgrep-config }}
+        USER_SARIF: ${{ inputs.sarif }}
+      run: |
+        set -euo pipefail
+        if [ -n "${USER_SARIF:-}" ]; then
+          echo "::notice::Both 'sarif' and 'semgrep: true' are set — using the provided sarif and skipping Semgrep."
+          exit 0
+        fi
+        echo "::group::Install & run Semgrep"
+        python3 -m pip install --quiet --disable-pip-version-check semgrep
+        # Ensure the console script is reachable even on a --user pip layout.
+        export PATH="$PATH:$(python3 -m site --user-base)/bin"
+        OUT="${RUNNER_TEMP:-/tmp}/ods-semgrep.sarif"
+        # Findings make Semgrep exit non-zero; ODS — not this step — gates on them.
+        semgrep --config "${SEMGREP_CONFIG:-auto}" --sarif --output "$OUT" || true
+        if [ -f "$OUT" ]; then
+          # Hand the path to the pipeline step via a step output, NOT
+          # GITHUB_ENV: env vars are job-scoped, so a GITHUB_ENV export leaks
+          # into every later invocation of this action in the same job and
+          # silently merges this SARIF into gates that never asked for it.
+          echo "sarif_path=$OUT" >> "$GITHUB_OUTPUT"
+          echo "Semgrep SARIF written to $OUT"
+        else
+          echo "::warning::Semgrep produced no SARIF file — continuing without it."
+        fi
+        echo "::endgroup::"
+
+    - name: Fetch git-ai authorship notes (best effort)
+      shell: bash
+      run: |
+        # git-ai (git-ai-project/git-ai) records line-level AI authorship
+        # under refs/notes/ai; the CLI reads it as the highest-fidelity
+        # attribution source. CI checkouts don't fetch notes by default, so
+        # pull them here. Best effort: absence is the normal case on repos
+        # not using git-ai, and a failed fetch must never fail the gate.
+        git fetch origin '+refs/notes/ai:refs/notes/ai' 2>/dev/null || true
+
     - name: Run ODS Pipeline
       id: ods
       shell: bash
       env:
+        # Scoped to this invocation via step output (empty when the Semgrep
+        # step was skipped) — see the leak note in the Semgrep step.
+        ODS_GENERATED_SARIF: ${{ steps.semgrep.outputs.sarif_path }}
         ODS_DIFF_BASE: ${{ inputs.diff-base }}
         ODS_PR_BODY: ${{ inputs.pr-body }}
         ODS_PR_BODY_FILE: ${{ inputs.pr-body-file }}
         ODS_BRANCH: ${{ inputs.branch }}
         ODS_COMMITS: ${{ inputs.commits }}
         ODS_POLICY: ${{ inputs.policy }}
+        ODS_SARIF: ${{ inputs.sarif }}
+        ODS_AI_REVIEW: ${{ inputs.ai-review }}
+        ODS_MUTATION: ${{ inputs.mutation-report }}
+        ODS_FAILURE_MODE: ${{ inputs.failure-mode }}
+        # PR checkouts are synthetic merge commits, so `git rev-parse HEAD`
+        # never matches the head SHA reviewers stamp into their verdicts.
+        # The CLI compares against this override instead (empty on non-PR
+        # events, where plain HEAD is correct).
+        ODS_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         ODS_OUTPUT_DIR: ${{ inputs.output-dir }}
         INPUT_SUMMARY: ${{ inputs.summary }}
         GITHUB_HEAD_REF: ${{ github.head_ref }}
@@ -124,25 +271,53 @@ runs:
       run: |
         set -euo pipefail
         mkdir -p "$ODS_OUTPUT_DIR"
+        # Later invocations in the same job may reuse the output dir; drop
+        # verdicts copied by a previous run so this gate's report only shows
+        # what THIS invocation was given.
+        rm -f "$ODS_OUTPUT_DIR"/ai-review-*.json
 
-        # Build detect flags
-        DETECT_FLAGS="--diff-base $ODS_DIFF_BASE --commits $ODS_COMMITS"
+        # ── Environment diagnostics: shallow checkout ─────────────────────
+        # actions/checkout defaults to fetch-depth: 1. ODS's diff- and
+        # history-based signals (base diff, commit-trailer attribution over
+        # multiple commits, git-ai notes, patch coverage / mutation scoping)
+        # silently degrade without history. Detect it up front and tell the
+        # user exactly what degrades and how to fix it, instead of letting a
+        # confident-looking report ride on partial inputs. Advisory only —
+        # never fails the run.
+        ODS_SHALLOW_CHECKOUT="false"
+        if [ "$(git rev-parse --is-shallow-repository 2>/dev/null)" = "true" ]; then
+          ODS_SHALLOW_CHECKOUT="true"
+          echo "::warning::Shallow checkout detected (fetch-depth: 1). ODS diff- and history-based signals degrade: the base diff may be empty (analysis/score/merge-confidence scope), and commit-trailer attribution can only scan the tip commit. Fix: set fetch-depth: 0 on actions/checkout — { uses: actions/checkout@v7, with: { fetch-depth: 0 } }"
+        fi
+        # The concrete symptom: the diff base isn't resolvable locally.
+        if [ -n "${ODS_DIFF_BASE:-}" ] && ! git rev-parse --verify --quiet "${ODS_DIFF_BASE}^{commit}" >/dev/null 2>&1; then
+          echo "::warning::diff-base '${ODS_DIFF_BASE}' does not resolve in this checkout — diff-scoped signals will be empty. This usually means a shallow checkout; set fetch-depth: 0 on actions/checkout."
+        fi
+        export ODS_SHALLOW_CHECKOUT
+
+        # Build detect args as an ARRAY expanded with quotes. Never splice the
+        # PR body into a flat string: unquoted expansion word-splits it, so any
+        # flag-looking token an author writes in a PR description (e.g. a
+        # `git push -f` snippet) becomes a CLI flag — breaking detection and
+        # handing PR authors an argument-injection vector. printf %q does NOT
+        # protect a string that is expanded without eval.
+        DETECT_ARGS=(--diff-base "$ODS_DIFF_BASE" --commits "$ODS_COMMITS")
         # Export diff-base for CLI commands that do not yet accept --diff-base
         export ODS_DIFF_BASE="$ODS_DIFF_BASE"
 
         PR_BODY_SOURCE=""
         if [ -n "${ODS_PR_BODY:-}" ]; then
-          DETECT_FLAGS="$DETECT_FLAGS --pr-body $(printf '%q' "$ODS_PR_BODY")"
+          DETECT_ARGS+=(--pr-body "$ODS_PR_BODY")
           PR_BODY_SOURCE="flag"
         elif [ -n "${ODS_PR_BODY_FILE:-}" ] && [ -f "$ODS_PR_BODY_FILE" ]; then
-          DETECT_FLAGS="$DETECT_FLAGS --pr-file $ODS_PR_BODY_FILE"
+          DETECT_ARGS+=(--pr-file "$ODS_PR_BODY_FILE")
           ODS_PR_BODY="$(cat "$ODS_PR_BODY_FILE")"
           PR_BODY_SOURCE="file"
         elif [ -n "${GITHUB_EVENT_PATH:-}" ] && [ -f "$GITHUB_EVENT_PATH" ]; then
           # Extract PR body from GitHub event using jq
           PR_BODY=$(jq -r '.pull_request.body // ""' "$GITHUB_EVENT_PATH" 2>/dev/null || echo "")
           if [ -n "$PR_BODY" ]; then
-            DETECT_FLAGS="$DETECT_FLAGS --pr-body $(printf '%q' "$PR_BODY")"
+            DETECT_ARGS+=(--pr-body "$PR_BODY")
             ODS_PR_BODY="$PR_BODY"
             PR_BODY_SOURCE="event"
           fi
@@ -156,7 +331,7 @@ runs:
           BRANCH=$(git branch --show-current 2>/dev/null || echo "")
         fi
         if [ -n "$BRANCH" ]; then
-          DETECT_FLAGS="$DETECT_FLAGS --branch $BRANCH"
+          DETECT_ARGS+=(--branch "$BRANCH")
           # Export both env var names for CLI compatibility
           export ODS_BRANCH="$BRANCH"
           export ODS_BRANCH_NAME="$BRANCH"
@@ -165,37 +340,132 @@ runs:
         echo "::group::① Detect — AI Code Detection"
         DETECT_JSON="$ODS_OUTPUT_DIR/detect.json"
         set +e
-        ods detect --json $DETECT_FLAGS > "$DETECT_JSON" 2>"$ODS_OUTPUT_DIR/detect.stderr"
+        ods detect --json "${DETECT_ARGS[@]}" > "$DETECT_JSON" 2>"$ODS_OUTPUT_DIR/detect.stderr"
         DETECT_EXIT=$?
         set -e
+        # ods detect exits non-zero for BOTH errors AND high-confidence positive results.
+        # Validate by checking for the expected 'ai_generated' key in the JSON output —
+        # if absent the file is empty/corrupt and detection is inconclusive.
+        if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if 'ai_generated' in d else 1)" "$DETECT_JSON" 2>/dev/null; then
+          echo "::warning::ods detect produced no valid output (exit=$DETECT_EXIT) — detection marked inconclusive"
+          if [ -s "$ODS_OUTPUT_DIR/detect.stderr" ]; then
+            echo "--- ods detect error output ---"
+            cat "$ODS_OUTPUT_DIR/detect.stderr"
+          fi
+          printf '{"_ods_detect_error":true,"ai_generated":false,"confidence":0,"evidence":[],"sources":[],"summary":"Detection inconclusive"}\n' > "$DETECT_JSON"
+        fi
         echo "::endgroup::"
 
         echo "::group::② Analyze — AI Code Quality"
         ANALYZE_JSON="$ODS_OUTPUT_DIR/analyze.json"
+        # Prefer a user-provided SARIF; otherwise use one generated by the
+        # optional Semgrep step (exported as ODS_GENERATED_SARIF).
+        SARIF_FILE="${ODS_SARIF:-}"
+        if [ -z "$SARIF_FILE" ] && [ -n "${ODS_GENERATED_SARIF:-}" ]; then
+          SARIF_FILE="$ODS_GENERATED_SARIF"
+        fi
+        # SARIF_FLAGS is shared across analyze/score/check so external findings
+        # reach the score and the policy gate, not just the analyze report.
+        SARIF_FLAGS=()
+        if [ -n "$SARIF_FILE" ]; then
+          if [ -f "$SARIF_FILE" ]; then
+            SARIF_FLAGS+=(--sarif "$SARIF_FILE")
+            echo "Merging external SARIF findings from: $SARIF_FILE"
+          else
+            echo "::warning::SARIF file '$SARIF_FILE' not found — skipping SARIF merge"
+          fi
+        fi
         set +e
-        ods analyze --json 2>/dev/null > "$ANALYZE_JSON" || \
-          echo '{"issues":[],"total_lines":0,"summary":"No code analyzed"}' > "$ANALYZE_JSON"
+        ods analyze --json "${SARIF_FLAGS[@]}" > "$ANALYZE_JSON" 2>"$ODS_OUTPUT_DIR/analyze.stderr"
+        ANALYZE_EXIT=$?
         set -e
+        # Judge success by valid JSON, NOT by exit code: `ods analyze` also exits
+        # non-zero when it finds issues, and that output is valid and must be
+        # kept. Only a genuinely broken run (no parseable {issues:...}) is
+        # inconclusive — it must never be masked as a clean, empty result.
+        if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) and 'issues' in d else 1)" "$ANALYZE_JSON" 2>/dev/null; then
+          echo "::warning::ods analyze produced no valid output (exit=$ANALYZE_EXIT) — analysis marked inconclusive"
+          [ -s "$ODS_OUTPUT_DIR/analyze.stderr" ] && { echo "--- ods analyze error output ---"; cat "$ODS_OUTPUT_DIR/analyze.stderr"; }
+          printf '{"_ods_stage_error":true,"issues":[],"total_lines":0,"summary":"Analysis inconclusive (ods analyze exited %s)"}\n' "$ANALYZE_EXIT" > "$ANALYZE_JSON"
+        fi
         echo "::endgroup::"
 
         echo "::group::③ Score — Technical Debt Impact"
         SCORE_JSON="$ODS_OUTPUT_DIR/score.json"
         set +e
-        ods score --json 2>/dev/null > "$SCORE_JSON" || \
-          echo '{"technical_debt_delta":0,"verdict":"neutral"}' > "$SCORE_JSON"
+        ods score --json "${SARIF_FLAGS[@]}" > "$SCORE_JSON" 2>"$ODS_OUTPUT_DIR/score.stderr"
+        SCORE_EXIT=$?
         set -e
+        # Same rule: a valid score JSON (has technical_debt_delta) is kept even on
+        # a non-zero exit; only a broken run is inconclusive, never a fake neutral.
+        if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) and 'technical_debt_delta' in d else 1)" "$SCORE_JSON" 2>/dev/null; then
+          echo "::warning::ods score produced no valid output (exit=$SCORE_EXIT) — scoring marked inconclusive"
+          [ -s "$ODS_OUTPUT_DIR/score.stderr" ] && { echo "--- ods score error output ---"; cat "$ODS_OUTPUT_DIR/score.stderr"; }
+          printf '{"_ods_stage_error":true,"technical_debt_delta":0,"verdict":"neutral","summary":"Scoring inconclusive (ods score exited %s)"}\n' "$SCORE_EXIT" > "$SCORE_JSON"
+        fi
         echo "::endgroup::"
 
         echo "::group::④ Check — Policy Enforcement"
+        # AI reviewer verdicts (review-verdict/v1) feed the check stage only.
+        # Advisory by default: they can route extra review, never deny.
+        # Same array discipline as the PR body — verdict paths are user input.
+        AI_REVIEW_FLAGS=()
+        if [ -n "${ODS_AI_REVIEW:-}" ]; then
+          if ods check --help 2>&1 | grep -q -- '--ai-review'; then
+            VERDICT_IDX=0
+            while IFS= read -r VERDICT_FILE; do
+              # trim surrounding whitespace
+              VERDICT_FILE="${VERDICT_FILE#"${VERDICT_FILE%%[![:space:]]*}"}"
+              VERDICT_FILE="${VERDICT_FILE%"${VERDICT_FILE##*[![:space:]]}"}"
+              [ -z "$VERDICT_FILE" ] && continue
+              if [ -f "$VERDICT_FILE" ]; then
+                AI_REVIEW_FLAGS+=(--ai-review "$VERDICT_FILE")
+                # Copy into the report dir so generate-report.py can render
+                # an AI Review section (and the artifact keeps the evidence).
+                cp "$VERDICT_FILE" "$ODS_OUTPUT_DIR/ai-review-$VERDICT_IDX.json"
+                VERDICT_IDX=$((VERDICT_IDX + 1))
+              else
+                echo "::warning::ai-review file '$VERDICT_FILE' not found — skipping"
+              fi
+            done < <(printf '%s\n' "$ODS_AI_REVIEW" | tr ',' '\n')
+          else
+            echo "::warning::The installed ODS CLI predates 'ods check --ai-review' — ignoring the ai-review input. Set cli-ref to a release with AI review support (or 'main')."
+          fi
+        fi
+        # Mutation report (gremlins JSON) feeds the check stage: its diff-scoped
+        # mutation score routes AI-authored changes with weak tests. Advisory by
+        # default. Gated on CLI support so older pins degrade gracefully.
+        MUTATION_FLAGS=()
+        if [ -n "${ODS_MUTATION:-}" ]; then
+          if ods check --help 2>&1 | grep -q -- '--mutation'; then
+            if [ -f "$ODS_MUTATION" ]; then
+              MUTATION_FLAGS+=(--mutation "$ODS_MUTATION")
+              echo "Feeding mutation report from: $ODS_MUTATION"
+            else
+              echo "::warning::mutation-report file '$ODS_MUTATION' not found — skipping"
+            fi
+          else
+            echo "::warning::The installed ODS CLI predates 'ods check --mutation' — ignoring the mutation-report input. Set cli-ref to a release with mutation support (or 'main')."
+          fi
+        fi
         CHECK_JSON="$ODS_OUTPUT_DIR/check.json"
         CHECK_EXIT=0
         set +e
         if [ -n "${ODS_POLICY:-}" ] && [ -f "$ODS_POLICY" ]; then
-          ods check --json --policy "$ODS_POLICY" > "$CHECK_JSON" 2>/dev/null || CHECK_EXIT=$?
+          ods check --json --policy "$ODS_POLICY" "${SARIF_FLAGS[@]}" "${AI_REVIEW_FLAGS[@]}" "${MUTATION_FLAGS[@]}" > "$CHECK_JSON" 2>"$ODS_OUTPUT_DIR/check.stderr" || CHECK_EXIT=$?
         else
-          ods check --json > "$CHECK_JSON" 2>/dev/null || CHECK_EXIT=$?
+          ods check --json "${SARIF_FLAGS[@]}" "${AI_REVIEW_FLAGS[@]}" "${MUTATION_FLAGS[@]}" > "$CHECK_JSON" 2>"$ODS_OUTPUT_DIR/check.stderr" || CHECK_EXIT=$?
         fi
         set -e
+        # A valid check result (has `allowed`) is kept even on a non-zero exit —
+        # `ods check` exits non-zero when it denies, and that's a real BLOCK, not
+        # a failure. Only a crash that yields no parseable verdict is
+        # inconclusive: never let a broken gate read as an allowed (passing) run.
+        if ! python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d, dict) and 'allowed' in d else 1)" "$CHECK_JSON" 2>/dev/null; then
+          echo "::warning::ods check produced no valid verdict (exit=$CHECK_EXIT) — policy check marked inconclusive"
+          [ -s "$ODS_OUTPUT_DIR/check.stderr" ] && { echo "--- ods check error output ---"; cat "$ODS_OUTPUT_DIR/check.stderr"; }
+          printf '{"_ods_stage_error":true,"allowed":true,"denials":[],"warnings":[],"summary":"Policy check inconclusive (ods check exited %s)"}\n' "$CHECK_EXIT" > "$CHECK_JSON"
+        fi
         echo "::endgroup::"
 
         # Generate report using external script
@@ -203,6 +473,30 @@ runs:
         REPORT_SCRIPT="${ACTION_DIR}/scripts/generate-report.py"
         # INPUT_SUMMARY env var tells the script whether to write to job summary
         python3 "$REPORT_SCRIPT" "$ODS_OUTPUT_DIR" "$GITHUB_OUTPUT"
+        echo "::endgroup::"
+
+        # AI-code evidence document (CycloneDX 1.6, spec proposal 001): serialize
+        # what the gate just evaluated into an auditable artifact. Runs BEFORE
+        # the block exit — the audit trail matters most for blocked changes.
+        # Best effort, gated on CLI support so older pins degrade gracefully.
+        echo "::group::Attest — AI-Code Evidence Document"
+        if ods attest --help >/dev/null 2>&1; then
+          # Per-stage integrity computed by the report script; empty when unknown.
+          ODS_PIPELINE_INTEGRITY=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('pipeline',{}).get('integrity',''))" "$ODS_OUTPUT_DIR/ods-report.json" 2>/dev/null || echo "")
+          export ODS_PIPELINE_INTEGRITY
+          ATTEST_FLAGS=("${SARIF_FLAGS[@]}" "${AI_REVIEW_FLAGS[@]}" "${MUTATION_FLAGS[@]}")
+          if [ -n "${ODS_POLICY:-}" ] && [ -f "$ODS_POLICY" ]; then
+            ATTEST_FLAGS+=(--policy "$ODS_POLICY")
+          fi
+          if ods attest --out "$ODS_OUTPUT_DIR/evidence.cdx.json" "${ATTEST_FLAGS[@]}" 2>"$ODS_OUTPUT_DIR/attest.stderr"; then
+            echo "Evidence document written to $ODS_OUTPUT_DIR/evidence.cdx.json (uploaded with the report artifact)"
+          else
+            echo "::warning::ods attest failed — evidence document skipped"
+            [ -s "$ODS_OUTPUT_DIR/attest.stderr" ] && cat "$ODS_OUTPUT_DIR/attest.stderr"
+          fi
+        else
+          echo "Installed ODS CLI predates 'ods attest' — skipping the evidence document."
+        fi
         echo "::endgroup::"
 
         # Read result from the script output
@@ -214,9 +508,53 @@ runs:
           exit 1
         fi
 
+    - name: AI Attribution Report (optional)
+      # always() so the digest still renders even when the pipeline blocked above.
+      if: always() && inputs.report == 'true'
+      shell: bash
+      env:
+        REPORT_SINCE: ${{ inputs.report-since }}
+        OUT_DIR: ${{ inputs.output-dir }}
+        INPUT_SUMMARY: ${{ inputs.summary }}
+        ACTION_DIR: ${{ github.action_path }}
+      run: |
+        set -uo pipefail
+        echo "::group::AI Attribution Report"
+        mkdir -p "$OUT_DIR"
+        if ! ods report --since "$REPORT_SINCE" --json > "$OUT_DIR/attribution.json" 2>"$OUT_DIR/attribution.stderr"; then
+          echo "::warning::ods report failed — skipping attribution digest"
+          [ -s "$OUT_DIR/attribution.stderr" ] && cat "$OUT_DIR/attribution.stderr"
+          echo "::endgroup::"
+          exit 0
+        fi
+        MD=$(python3 "$ACTION_DIR/scripts/render-attribution.py" "$OUT_DIR/attribution.json") || {
+          echo "::warning::could not render attribution digest"; echo "::endgroup::"; exit 0; }
+
+        # Shareable HTML dashboard (ods report --html, v0.7.2+). Best effort:
+        # older CLIs lack the flag, so guard on it and never fail the step. The
+        # file lands in the report dir and rides along in the uploaded artifact.
+        if ods report --help 2>&1 | grep -q -- '--html'; then
+          if ods report --since "$REPORT_SINCE" --html "$OUT_DIR/ai-attribution.html" >/dev/null 2>&1; then
+            MD="${MD}"$'\n\n📊 An interactive AI-attribution dashboard (`ai-attribution.html`) is included in the ODS report artifact — download it and open in a browser.'
+            echo "AI attribution dashboard written to $OUT_DIR/ai-attribution.html"
+          fi
+        fi
+
+        printf '%s\n' "$MD" > "$OUT_DIR/ods-attribution.md"
+        # Append to the shared summary so it also reaches the PR comment.
+        if [ -f "$OUT_DIR/ods-summary.md" ]; then
+          printf '\n%s\n' "$MD" >> "$OUT_DIR/ods-summary.md"
+        fi
+        # Append to the GitHub job summary.
+        if [ "${INPUT_SUMMARY:-true}" = "true" ] && [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+          printf '\n%s\n' "$MD" >> "$GITHUB_STEP_SUMMARY"
+        fi
+        echo "$MD"
+        echo "::endgroup::"
+
     - name: Upload ODS Report
       if: inputs.artifact == 'true'
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
       with:
         name: ${{ inputs.artifact-name }}
         path: ${{ inputs.output-dir }}/
@@ -293,3 +631,52 @@ runs:
           "$URL" \
           --data-binary "@/tmp/ods-comment.json" \
           >/dev/null 2>/dev/null || echo "::warning::Unable to create or update ODS PR comment."
+
+    - name: Review routing
+      # Runs only when the gate passed — deny wins, a blocked PR is never
+      # routed. Routing is advisory: every failure here is a warning, never a
+      # failed run.
+      if: inputs.review-routing == 'true' && github.event_name == 'pull_request'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        TIER: ${{ steps.ods.outputs.review_tier }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+        ELEVATED_REVIEWERS: ${{ inputs.elevated-reviewers }}
+      run: |
+        set -euo pipefail
+
+        if [ -z "${GH_TOKEN:-}" ]; then
+          echo "::warning::Skipping review routing because github-token is empty."
+          exit 0
+        fi
+
+        TIER="${TIER:-standard}"
+        echo "Review tier: $TIER"
+
+        declare -A COLORS=([auto]="2da44e" [standard]="0969da" [elevated]="d4a72c")
+
+        # Ensure the tier labels exist, then converge the PR to exactly one.
+        for t in auto standard elevated; do
+          gh label create "ods:review/$t" \
+            --color "${COLORS[$t]}" \
+            --description "ODS review tier: $t" \
+            --force >/dev/null 2>&1 || true
+        done
+        for t in auto standard elevated; do
+          [ "$t" = "$TIER" ] && continue
+          gh pr edit "$PR_URL" --remove-label "ods:review/$t" >/dev/null 2>&1 || true
+        done
+        gh pr edit "$PR_URL" --add-label "ods:review/$TIER" >/dev/null 2>&1 || \
+          echo "::warning::Could not apply review-tier label (insufficient token permissions?)."
+
+        # Elevated tier: request the configured reviewers.
+        if [ "$TIER" = "elevated" ] && [ -n "${ELEVATED_REVIEWERS:-}" ]; then
+          IFS=',' read -ra REVIEWERS <<< "$ELEVATED_REVIEWERS"
+          for r in "${REVIEWERS[@]}"; do
+            r="$(echo "$r" | tr -d '[:space:]')"
+            [ -z "$r" ] && continue
+            gh pr edit "$PR_URL" --add-reviewer "$r" >/dev/null 2>&1 || \
+              echo "::warning::Could not request review from '$r' (not a collaborator, or the PR author)."
+          done
+        fi

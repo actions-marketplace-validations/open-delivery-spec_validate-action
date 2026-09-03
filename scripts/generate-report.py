@@ -9,11 +9,25 @@ Appends Markdown to $GITHUB_STEP_SUMMARY if set.
 Writes step outputs to github-output-file.
 """
 
+import glob
 import html
 import json
 import os
 import sys
 from datetime import datetime, timezone
+
+# Merge-confidence thresholds. Shared by the WARN decision and the table icons
+# so a row can never render ✅ while the same number pushes the gate to WARN.
+# They mirror the CLI default policy's thresholds.
+PATCH_COVERAGE_THRESHOLD = 0.8
+MUTATION_SCORE_THRESHOLD = 0.5
+
+# PR-comment budget. The report is read in a PR conversation, so the tables that
+# grow with the size of the change are bounded: a 60-file AI change must not push
+# the verdict and the merge-confidence facts off the screen.
+FILE_ROWS_SHOWN = 10
+FILES_COLLAPSE_AFTER = 5
+EVIDENCE_ROWS_SHOWN = 50
 
 
 def load_json(path):
@@ -39,6 +53,79 @@ def h(value):
     return html.escape(str(value), quote=True)
 
 
+def coverage_label(cov):
+    """Format a coverage fraction for display.
+
+    ODS uses -1.0 as the "not measured" sentinel; rendering it as a percentage
+    produces a nonsensical "-100%". Show "N/A" instead, matching the CLI's
+    FormatScore behavior.
+    """
+    try:
+        cov = float(cov)
+    except (TypeError, ValueError):
+        return "N/A"
+    if cov < 0:
+        return "N/A"
+    return f"{cov*100:.0f}%"
+
+
+def _details(summary, body_lines):
+    """Wrap Markdown in a collapsed <details> block.
+
+    The blank line after </summary> is required: without it GitHub renders the
+    body as literal text instead of Markdown.
+    """
+    return ["", "<details>", f"<summary>{summary}</summary>", ""] + body_lines + ["", "</details>"]
+
+
+def attention_reasons(
+    detect_error,
+    inconclusive_stages,
+    policy_allowed,
+    denials,
+    warnings_list,
+    review_tier,
+):
+    """Why this run is not a clean pass — the reasons behind the result badge.
+
+    Two kinds of reason, and only two:
+
+    * **The policy said so** — a denial, a warning, or routing to elevated
+      review. What counts as a problem is the team's decision, expressed in
+      their Rego, so the deterministic signals (merge confidence, patch
+      coverage, mutation score, AI-review verdicts) reach this badge only
+      through the policy that consumed them. This generator renders; it does
+      not invent verdicts, and it never overrides a team that deliberately
+      chose not to warn about something.
+    * **The pipeline could not answer** — detection or a stage did not
+      complete, so silence here is missing data, not a clean result.
+
+    AI involvement is deliberately *not* a reason. A clean AI-authored change
+    is a PASS: attribution routes review and grades evidence, it is not itself
+    a finding. Flagging every AI change made the badge carry no information for
+    teams whose changes are mostly AI-authored, and contradicted the scorer,
+    which is built so that a clean fully-AI change scores ~0.
+    """
+    reasons = []
+    if not policy_allowed:
+        n = len(denials)
+        reasons.append(
+            f"policy denied the change ({n} denial{'s' if n != 1 else ''})"
+            if n else "policy denied the change"
+        )
+    if detect_error:
+        reasons.append("AI detection did not complete")
+    if inconclusive_stages:
+        n = len(inconclusive_stages)
+        reasons.append(f"{n} pipeline stage{'s' if n != 1 else ''} did not complete")
+    if warnings_list:
+        n = len(warnings_list)
+        reasons.append(f"{n} policy warning{'s' if n != 1 else ''}")
+    if review_tier == "elevated":
+        reasons.append("policy routed this to elevated review")
+    return reasons
+
+
 def main():
     report_dir = sys.argv[1]
     github_output = sys.argv[2] if len(sys.argv) > 2 else ""
@@ -48,6 +135,35 @@ def main():
     score = load_json(os.path.join(report_dir, "score.json"))
     check = load_json(os.path.join(report_dir, "check.json"))
 
+    # AI reviewer verdicts (review-verdict/v1) copied in by the action when
+    # the ai-review input is set. Best effort: unparseable files are skipped.
+    ai_reviews = []
+    for path in sorted(glob.glob(os.path.join(report_dir, "ai-review-*.json"))):
+        verdict = load_json(path)
+        if verdict.get("verdict"):
+            ai_reviews.append(verdict)
+
+    # Pipeline integrity — a stage is "inconclusive" when its command failed to
+    # produce a usable result (the action marks it with _ods_detect_error /
+    # _ods_stage_error rather than writing a clean-looking zero result). A broken
+    # stage must never read as a passing gate.
+    failure_mode = (os.environ.get("ODS_FAILURE_MODE", "warn") or "warn").strip().lower()
+    if failure_mode not in ("warn", "block"):
+        failure_mode = "warn"
+    # Shallow checkout flag set by the action's environment diagnostics: diff-
+    # and history-based signals may be running on partial inputs. Advisory —
+    # surfaced in the report so degraded numbers are never read as authoritative.
+    shallow_checkout = (os.environ.get("ODS_SHALLOW_CHECKOUT", "") or "").strip().lower() == "true"
+    stages = {
+        "detect": "inconclusive" if detect.get("_ods_detect_error") else "completed",
+        "analyze": "inconclusive" if analyze.get("_ods_stage_error") else "completed",
+        "score": "inconclusive" if score.get("_ods_stage_error") else "completed",
+        "check": "inconclusive" if check.get("_ods_stage_error") else "completed",
+    }
+    inconclusive_stages = [name for name, st in stages.items() if st == "inconclusive"]
+    pipeline_ok = not inconclusive_stages
+
+    detect_error = detect.get("_ods_detect_error", False)
     ai_detected = detect.get("ai_generated", False)
     ai_confidence = detect.get("confidence", 0)
     detect_summary = detect.get("summary", "No AI detection result")
@@ -56,26 +172,55 @@ def main():
     verdict = score.get("verdict", "neutral")
     recommendation = score.get("recommendation", "")
     policy_allowed = check.get("allowed", True)
+    # Absent on policies (or CLIs) without review routing — treat as standard.
+    review_tier = check.get("review_tier") or "standard"
     denials = check.get("denials", [])
     warnings_list = check.get("warnings", [])
+    # Deterministic merge-confidence facts the gate saw (echoed by ods check
+    # --json; absent on older CLIs). {} when unavailable.
+    merge_confidence = check.get("merge_confidence") or {}
+    # Patch (diff) coverage of the change's added lines. Echoed top-level by
+    # ods check --json; -1 or None means not measured (absent on older CLIs).
+    patch_coverage = check.get("patch_coverage")
+    # Diff-scoped mutation score of the change's added lines. Echoed top-level by
+    # ods check --json; -1 or None means not measured (absent on older CLIs).
+    mutation_score = check.get("mutation_score")
+    # Evidence tier: how the AI attribution was obtained (corroborated/attested/
+    # inferred). Echoed by ods check --json; absent on older CLIs.
+    evidence_tier = check.get("evidence_tier")
     issues = analyze.get("issues", [])
     files = detect.get("files", [])
     evidence = detect.get("evidence", [])
     sources = detect.get("sources", [])
 
-    # Determine overall result
+    # Determine overall result. The badge answers "does this need a human?", not
+    # "was AI involved" \u2014 every reason is listed under the badge so a WARN is
+    # never unexplained.
+    reasons = attention_reasons(
+        detect_error=detect_error,
+        inconclusive_stages=inconclusive_stages,
+        policy_allowed=policy_allowed,
+        denials=denials,
+        warnings_list=warnings_list,
+        review_tier=review_tier,
+    )
     if not policy_allowed:
+        # Policy denial is authoritative.
         overall = "\u274c BLOCK"
         result_value = "block"
-    elif ai_detected and ai_confidence >= 0.8 and len(issues) > 0:
-        overall = "\u26a0\ufe0f  WARN"
-        result_value = "warn"
-    elif ai_detected:
+    elif reasons:
         overall = "\u26a0\ufe0f  WARN"
         result_value = "warn"
     else:
         overall = "\u2705 PASS"
         result_value = "pass"
+
+    # Pipeline integrity override: a stage that did not complete must never read
+    # as a clean PASS. Advisory by default (already WARN via the reasons above);
+    # fail-closed teams set failure-mode: block to turn it into a BLOCK.
+    if inconclusive_stages and failure_mode == "block":
+        overall = "\u274c BLOCK"
+        result_value = "block"
 
     # Write GitHub step outputs
     if github_output:
@@ -85,11 +230,18 @@ def main():
             f.write(f"ai_confidence={ai_confidence}\n")
             f.write(f"tech_debt_delta={tech_debt}\n")
             f.write(f"policy_allowed={'true' if policy_allowed else 'false'}\n")
+            f.write(f"review_tier={review_tier}\n")
+            f.write(f"detect_error={'true' if detect_error else 'false'}\n")
+            f.write(f"pipeline_integrity={'ok' if pipeline_ok else 'inconclusive'}\n")
 
     # Combined JSON report
     report = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "result": result_value,
+        # Why the result is not a clean pass — empty on PASS. Machine-readable
+        # counterpart of the "Why" line in the Markdown report.
+        "result_reasons": reasons,
+        "detect_error": detect_error,
         "ai_detected": ai_detected,
         "ai_confidence": ai_confidence,
         "ai_files": files,
@@ -108,8 +260,21 @@ def main():
         },
         "policy": {
             "allowed": policy_allowed,
+            "review_tier": review_tier,
             "denials": denials,
             "warnings": warnings_list,
+        },
+        "ai_reviews": ai_reviews,
+        "merge_confidence": merge_confidence,
+        "patch_coverage": patch_coverage,
+        "mutation_score": mutation_score,
+        "evidence_tier": evidence_tier,
+        "pipeline": {
+            "integrity": "ok" if pipeline_ok else "inconclusive",
+            "stages": stages,
+            "inconclusive": inconclusive_stages,
+            "failure_mode": failure_mode,
+            "shallow_checkout": shallow_checkout,
         },
     }
 
@@ -120,12 +285,15 @@ def main():
     md = build_markdown(
         overall=overall,
         result_value=result_value,
+        reasons=reasons,
+        detect_error=detect_error,
         ai_detected=ai_detected,
         ai_confidence=ai_confidence,
         tech_debt=tech_debt,
         verdict=verdict,
         recommendation=recommendation,
         policy_allowed=policy_allowed,
+        review_tier=review_tier,
         evidence=evidence,
         analyze_summary=analyze_summary,
         issues=issues,
@@ -133,6 +301,21 @@ def main():
         denials=denials,
         warnings_list=warnings_list,
         files=files,
+        ai_reviews=ai_reviews,
+        merge_confidence=merge_confidence,
+        patch_coverage=patch_coverage,
+        mutation_score=mutation_score,
+        evidence_tier=evidence_tier,
+        stages=stages,
+        inconclusive_stages=inconclusive_stages,
+        failure_mode=failure_mode,
+        shallow_checkout=shallow_checkout,
+        stage_summaries={
+            "detect": detect.get("summary", ""),
+            "analyze": analyze.get("summary", ""),
+            "score": score.get("summary", ""),
+            "check": check.get("summary", ""),
+        },
     )
 
     summary_path = os.path.join(report_dir, "ods-summary.md")
@@ -155,6 +338,7 @@ def main():
     html = build_html(
         result_value=result_value,
         overall=overall,
+        detect_error=detect_error,
         ai_detected=ai_detected,
         ai_confidence=ai_confidence,
         tech_debt=tech_debt,
@@ -177,27 +361,118 @@ def main():
 def build_markdown(**kw):
     # NOTE: keep backslash escapes out of f-string expression braces \u2014 that
     # syntax requires Python 3.12+, but CI runners may ship an older python3.
-    ai_label = "\U0001f916 Yes" if kw["ai_detected"] else "\U0001f464 No"
+    if kw.get("detect_error"):
+        ai_label = "⚠️ Inconclusive"
+    elif kw["ai_detected"]:
+        ai_label = "\U0001f916 Yes"
+    else:
+        ai_label = "\U0001f464 No"
     policy_label = "\u2705 Allowed" if kw["policy_allowed"] else "\u274c Blocked"
     lines = [
         "<!-- ods-compliance-report -->",
-        "## ODS AI Code Quality Report",
+        "## ODS AI Code Report",
         "",
         f"**Result:** {kw['overall']}  ",
         f"**AI Detected:** {ai_label} (confidence: {kw['ai_confidence']*100:.0f}%)  ",
+    ]
+    # Evidence tier — how the attribution was obtained (shown only when AI is
+    # detected and the CLI reported a tier). A confidence label, not proof.
+    ev_tier = kw.get("evidence_tier")
+    if kw["ai_detected"] and not kw.get("detect_error") and ev_tier:
+        ev_icon = {"corroborated": "\U0001f7e2", "attested": "\U0001f7e1", "inferred": "\U0001f7e0"}.get(ev_tier, "")
+        lines.append(f"**Evidence:** {ev_icon} {ev_tier}  ")
+    lines.extend([
         f"**Tech Debt Delta:** {kw['tech_debt']:+.1f} ({kw['verdict']})  ",
         f"**Policy:** {policy_label}  ",
-        "",
-    ]
+    ])
+    if kw["policy_allowed"]:
+        tier = kw.get("review_tier", "standard")
+        tier_icon = {"auto": "\U0001f7e2", "standard": "\U0001f535", "elevated": "\U0001f7e0"}.get(tier, "")
+        lines.append(f"**Review Tier:** {tier_icon} {tier}  ")
+    # Why the badge is not green. A WARN a reader cannot explain is noise, so
+    # every reason that produced it is named here, in one line.
+    reasons = kw.get("reasons") or []
+    if reasons:
+        lines.append(f"**Why:** {md_cell('; '.join(reasons))}  ")
+    lines.append("")
+
+    # Shallow-checkout notice — diff/history signals may be running on partial
+    # inputs. Advisory: it explains the degradation and the fix, it does not
+    # change the result.
+    if kw.get("shallow_checkout"):
+        lines.extend([
+            "> **⚠️ Shallow checkout** — this workflow checked out only the tip commit "
+            "(`fetch-depth: 1`, the `actions/checkout` default). Diff- and history-based "
+            "signals are degraded: the base diff may be empty and commit-trailer "
+            "attribution can only scan one commit. Fix:",
+            "> ```yaml",
+            "> - uses: actions/checkout@v7",
+            ">   with:",
+            ">     fetch-depth: 0",
+            "> ```",
+            "",
+        ])
+
+    # Pipeline integrity — surface stage failures loudly. A stage that did not
+    # complete is never silently reported as a clean result; it is called out
+    # here and forces the run to at least WARN (or BLOCK under failure-mode).
+    stages = kw.get("stages") or {}
+    inconclusive = kw.get("inconclusive_stages") or []
+    if inconclusive:
+        summaries = kw.get("stage_summaries") or {}
+        icon = {"completed": "✅", "inconclusive": "⚠️"}
+        lines.extend([
+            "### \U0001f6e0️ Pipeline Integrity",
+            "",
+            f"> **⚠️ {len(inconclusive)} stage(s) did not complete** — results below may be incomplete. "
+            + ("Failing the run (`failure-mode: block`)." if kw.get("failure_mode") == "block"
+               else "Marked **WARN** so this is not read as a clean pass."),
+            "",
+            "| Stage | Status |",
+            "|-------|--------|",
+        ])
+        for name in ("detect", "analyze", "score", "check"):
+            st = stages.get(name, "completed")
+            note = f" — {md_cell(summaries.get(name))}" if st == "inconclusive" and summaries.get(name) else ""
+            lines.append(f"| {name} | {icon.get(st, '')} {st}{note} |")
+        lines.append("")
+        lines.append("_Check the workflow logs for each stage's error output._")
+        lines.append("")
 
     # Detection
     lines.append("### \U0001f50d Detection")
+    if kw.get("detect_error"):
+        lines.extend([
+            "",
+            "> **⚠️ Detection inconclusive** — `ods detect` did not complete successfully.",
+            "> This PR is marked **WARN** until detection can be confirmed.",
+            "> Check the workflow logs (`ods detect error output` group) for the root cause.",
+            "",
+        ])
     ev = kw["evidence"]
     if ev:
-        lines.extend(["", "| Source | Signal | Confidence |", "|--------|--------|-----------|"])
+        # One row per source, not per signal: a four-commit PR produced four
+        # near-identical commit-trailer rows saying the same thing. The strongest
+        # signal represents its source; the full list stays one click away.
+        grouped = {}
         for e in ev:
-            lines.append(f"| {md_cell(e.get('source','?'))} | {md_cell(e.get('value','?'))} | {e.get('confidence',0)*100:.0f}% |")
-    else:
+            grouped.setdefault(str(e.get("source", "?")), []).append(e)
+        lines.extend(["", "| Source | Signal | Confidence |", "|--------|--------|-----------|"])
+        for source, entries in grouped.items():
+            top = max(entries, key=lambda x: x.get("confidence") or 0)
+            signal = md_cell(top.get("value", "?"))
+            if len(entries) > 1:
+                signal += f" _(+{len(entries) - 1} more)_"
+            lines.append(f"| {md_cell(source)} | {signal} | {(top.get('confidence') or 0)*100:.0f}% |")
+        if len(ev) > len(grouped):
+            detail = ["| Source | Signal | Confidence |", "|--------|--------|-----------|"] + [
+                f"| {md_cell(e.get('source','?'))} | {md_cell(e.get('value','?'))} | {(e.get('confidence') or 0)*100:.0f}% |"
+                for e in ev[:EVIDENCE_ROWS_SHOWN]
+            ]
+            if len(ev) > EVIDENCE_ROWS_SHOWN:
+                detail.append(f"| _and {len(ev) - EVIDENCE_ROWS_SHOWN} more_ |  |  |")
+            lines.extend(_details(f"All {len(ev)} detection signals", detail))
+    elif not kw.get("detect_error"):
         lines.append("No AI code detected.")
 
     # Analysis
@@ -219,11 +494,99 @@ def build_markdown(**kw):
         f"| AI Code Ratio | {b.get('ai_code_ratio',0)*100:.0f}% |",
         f"| Defect Density | {b.get('defect_density',0):.1f} / KLOC |",
         f"| Critical Issues | {b.get('critical_issues',0)} |",
-        f"| Test Coverage | {b.get('test_coverage',0)*100:.0f}% |",
+        f"| Test Coverage | {coverage_label(b.get('test_coverage',0))} |",
         f"| Duplication Rate | {b.get('duplication_rate',0)*100:.0f}% |",
         "",
         f"**Verdict:** {kw['verdict']} \u2014 {kw['recommendation']}",
     ])
+
+    # Merge Confidence — deterministic diff facts (tested? shaped like real
+    # work? touches sensitive paths?). Echoed by ods check --json; absent on
+    # older CLIs, in which case this section is skipped.
+    mc = kw.get("merge_confidence") or {}
+    patch_coverage = kw.get("patch_coverage")
+    patch_measured = isinstance(patch_coverage, (int, float)) and patch_coverage >= 0
+    mutation_score = kw.get("mutation_score")
+    mutation_measured = isinstance(mutation_score, (int, float)) and mutation_score >= 0
+    if mc or patch_measured or mutation_measured:
+        tests_icon = "✅" if mc.get("tests_touched") else "⚠️"
+        risky = mc.get("risky_paths") or []
+        lines.extend([
+            "",
+            "### \U0001f6e1️ Merge Confidence",
+            "",
+            "| Signal | Value |",
+            "|--------|-------|",
+            f"| Tests touched | {tests_icon} {'yes' if mc.get('tests_touched') else 'no'} |",
+            f"| Source added without tests | {'⚠️ yes' if mc.get('added_source_without_tests') else '✅ no'} |",
+        ])
+        if patch_measured:
+            pct = round(patch_coverage * 100)
+            patch_icon = "✅" if patch_coverage >= PATCH_COVERAGE_THRESHOLD else "⚠️"
+            lines.append(f"| Patch coverage (added lines) | {patch_icon} {pct}% |")
+        if mutation_measured:
+            pct = round(mutation_score * 100)
+            mut_icon = "✅" if mutation_score >= MUTATION_SCORE_THRESHOLD else "⚠️"
+            lines.append(f"| Mutation score (added lines) | {mut_icon} {pct}% |")
+        if mc:
+            lines.append(
+                f"| Files changed | {mc.get('files_changed', 0)} ({mc.get('source_files_changed', 0)} source, {mc.get('test_files_changed', 0)} test) |"
+            )
+            lines.append(f"| Sensitive paths touched | {len(risky)} |")
+        if risky:
+            for p in risky[:10]:
+                lines.append(f"| ↳ | `{md_cell(p)}` |")
+            if len(risky) > 10:
+                lines.append(f"| ↳ | _and {len(risky)-10} more_ |")
+        lines.append("")
+        lines.append("_Deterministic facts from the diff — no LLM. Advisory by default; AI-authored changes route to extra review._")
+
+    # AI Review — semantic verdicts from AI reviewers. Advisory by default:
+    # they route review attention and never block unless the policy opts in.
+    ai_reviews = kw.get("ai_reviews") or []
+    if ai_reviews:
+        verdict_icon = {
+            "approve": "✅",
+            "request_changes": "\U0001f536",
+            "comment": "\U0001f4ac",
+        }
+        lines.extend([
+            "",
+            "### \U0001f9e0 AI Review",
+            "",
+            "| Reviewer | Verdict | Findings |",
+            "|----------|---------|----------|",
+        ])
+        for r in ai_reviews:
+            reviewer = r.get("reviewer") or {}
+            name = reviewer.get("tool", "?")
+            if reviewer.get("model"):
+                name = f"{name} ({reviewer['model']})"
+            v = r.get("verdict", "?")
+            icon = verdict_icon.get(v, "")
+            lines.append(f"| {md_cell(name)} | {icon} {md_cell(v)} | {len(r.get('findings') or [])} |")
+        findings = [
+            (r.get("reviewer", {}).get("tool", "?"), f)
+            for r in ai_reviews
+            for f in (r.get("findings") or [])
+        ]
+        if findings:
+            lines.extend([
+                "",
+                "| Reviewer | Location | Severity | Message |",
+                "|----------|----------|----------|---------|",
+            ])
+            for tool, f in findings[:10]:
+                loc = f.get("file", "?")
+                if f.get("line"):
+                    loc = f"{loc}:{f['line']}"
+                lines.append(f"| {md_cell(tool)} | {md_cell(loc)} | {md_cell(f.get('severity', '—'))} | {md_cell(f.get('message', '?'))} |")
+            if len(findings) > 10:
+                lines.append(f"| ... | ... | ... | _and {len(findings)-10} more_ |")
+        lines.extend([
+            "",
+            "_AI review verdicts are advisory: they can route extra human review, never block, unless your policy opts in._",
+        ])
 
     # Policy
     if kw["denials"]:
@@ -235,16 +598,27 @@ def build_markdown(**kw):
         for w in kw["warnings_list"]:
             lines.append(f"- \u26a0\ufe0f  {w}")
 
-    # Files
+    # Files — the only table that used to grow without a bound. Ranked by AI
+    # lines so the truncated tail is the least interesting part, and collapsed
+    # once the list is long enough to bury the sections above it.
     files = kw["files"]
     if files:
-        lines.extend(["", "### \U0001f4c1 AI-Detected Files", ""])
-        lines.extend([
+        ranked = sorted(files, key=lambda f: f.get("ai_lines") or 0, reverse=True)
+        shown = ranked[:FILE_ROWS_SHOWN]
+        table = [
             "| File | AI Lines | Total | Confidence |",
             "|------|----------|-------|-----------|",
-        ])
-        for f in files:
-            lines.append(f"| {md_cell(f.get('path','?'))} | {f.get('ai_lines',0)} | {f.get('total_lines',0)} | {f.get('confidence',0)*100:.0f}% |")
+        ]
+        for f in shown:
+            table.append(f"| {md_cell(f.get('path','?'))} | {f.get('ai_lines',0)} | {f.get('total_lines',0)} | {f.get('confidence',0)*100:.0f}% |")
+        if len(ranked) > FILE_ROWS_SHOWN:
+            table.append(f"| _and {len(ranked) - FILE_ROWS_SHOWN} more_ |  |  |  |")
+        lines.extend(["", "### \U0001f4c1 AI-Detected Files"])
+        total_ai = sum((f.get("ai_lines") or 0) for f in ranked)
+        if len(ranked) > FILES_COLLAPSE_AFTER:
+            lines.extend(_details(f"{len(ranked)} files, {total_ai} AI lines", table))
+        else:
+            lines.extend([""] + table)
 
     return "\n".join(lines) + "\n"
 
@@ -288,11 +662,19 @@ def build_html(**kw):
     sev_badge = (
         lambda s: f'<span class="sev sev-{h(str(s).lower())}">{h(s)}</span>'
     )
+    if kw.get("detect_error"):
+        _detect_empty = (
+            '<tr><td colspan="3" class="empty detect-error">'
+            '⚠️ Detection inconclusive — ods detect did not complete. '
+            'Check workflow logs for the root cause.</td></tr>'
+        )
+    else:
+        _detect_empty = '<tr><td colspan="3" class="empty">No AI code detected.</td></tr>'
     evidence_rows = "".join(
         f"<tr><td>{h(e.get('source','?'))}</td><td>{h(e.get('value','?'))}</td>"
         f"<td class=num>{e.get('confidence',0)*100:.0f}%</td></tr>"
         for e in kw["evidence"]
-    ) or '<tr><td colspan="3" class="empty">No AI code detected.</td></tr>'
+    ) or _detect_empty
     issue_rows = "".join(
         f"<tr><td><code>{h(i.get('rule','?'))}</code></td><td>{h(i.get('file','?'))}</td>"
         f"<td>{sev_badge(i.get('severity','?'))}</td><td>{h(i.get('message','?'))}</td></tr>"
@@ -305,10 +687,11 @@ def build_html(**kw):
     )
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    def bar(label, pct):
+    def bar(label, pct, display=None):
+        shown = display if display is not None else f"{pct:.0f}%"
         return (
             f'<div class="metric"><div class="metric-head"><span>{h(label)}</span>'
-            f'<span class="num">{pct:.0f}%</span></div>'
+            f'<span class="num">{h(shown)}</span></div>'
             f'<div class="track"><div class="fill" style="width:{min(max(pct,0),100):.0f}%"></div></div></div>'
         )
 
@@ -317,7 +700,7 @@ def build_html(**kw):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ODS AI Code Quality Report</title>
+<title>ODS AI Code Report</title>
 <style>
   :root {{ --bg:#0d1117; --panel:#161b22; --border:#30363d; --fg:#c9d1d9; --muted:#8b949e; --fg-strong:#f0f6fc;
            --pass:#2ea043; --warn:#d29922; --block:#cf222e; --accent:#58a6ff; }}
@@ -346,6 +729,7 @@ def build_html(**kw):
   th {{ background: var(--panel); color: var(--fg-strong); font-weight: 600; }}
   td.num, th.num {{ text-align: right; font-variant-numeric: tabular-nums; }}
   td.empty {{ color: var(--muted); text-align: center; padding: 18px; }}
+  td.detect-error {{ color: var(--warn); }}
   code {{ background: #6e768133; padding: 1px 6px; border-radius: 4px; font-size: .9em; }}
   .sev {{ font-size: .8em; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }}
   .sev-critical {{ background: #cf222e22; color: var(--block); }}
@@ -362,7 +746,7 @@ def build_html(**kw):
 <body>
 <header>
   <div>
-    <h1>ODS AI Code Quality Report</h1>
+    <h1>ODS AI Code Report</h1>
     <div class="sub">Detect · Analyze · Score · Enforce</div>
   </div>
   <div class="result {result_value}">{overall_text}</div>
@@ -370,7 +754,7 @@ def build_html(**kw):
 
 <div class="cards">
   <div class="card"><div class="label">AI Detected</div>
-    <div class="value">{'🤖 Yes' if kw['ai_detected'] else '👤 No'}</div>
+    <div class="value">{'⚠️ Inconclusive' if kw.get('detect_error') else ('🤖 Yes' if kw['ai_detected'] else '👤 No')}</div>
     <div class="sub">{kw['ai_confidence']*100:.0f}% confidence</div></div>
   <div class="card"><div class="label">Tech Debt Delta</div>
     <div class="value">{kw['tech_debt']:+.1f}</div>
@@ -390,7 +774,7 @@ def build_html(**kw):
 
 <div class="section"><h2>📈 Technical Debt Breakdown</h2>
 {bar('AI Code Ratio', b.get('ai_code_ratio',0)*100)}
-{bar('Test Coverage', b.get('test_coverage',0)*100)}
+{bar('Test Coverage', b.get('test_coverage',0)*100, coverage_label(b.get('test_coverage',0)))}
 {bar('Duplication Rate', b.get('duplication_rate',0)*100)}
 <table><tbody>
 <tr><td>Defect Density</td><td class="num">{b.get('defect_density',0):.1f} / KLOC</td></tr>

@@ -15,8 +15,14 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-latest
+    env:
+      # Dogfooding installs the CLI at a fresh commit SHA; sum.golang.org
+      # intermittently 500s while verifying an unreleased pseudo-version.
+      # Skip checksum-DB verification here — this is our own just-built
+      # code, and adopters pinned to a released tag are unaffected.
+      GOSUMDB: "off"
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           ref: ${{ github.head_ref }}
@@ -27,7 +33,7 @@ jobs:
           commit-check --message --branch
 
       - name: ODS AI code quality gate
-        uses: open-delivery-spec/validate-action@v1
+        uses: open-delivery-spec/validate-action@4cfdc6fb1adf69b273c78755cd5dfa0b8d6de7ec # v1
         with:
           diff-base: ${{ github.event.pull_request.base.sha || 'origin/main' }}
           branch: ${{ github.head_ref }}
